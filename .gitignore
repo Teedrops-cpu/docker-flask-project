@@ -1,4 +1,4 @@
-ven/
+venv/
 __pycache__/
 *.pyc
-:Zone.Identifier
+*:Zone.Identifier
