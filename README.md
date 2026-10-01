@@ -5,7 +5,8 @@ This project packages a simple Flask web application into a Docker image so it
 runs identically on any machine with Docker installed, independent of the host's
 Python version, installed packages, or operating system. It covers writing a
 Dockerfile, building an image, running a container with port mapping, managing
-the container lifecycle, and optimizing the build for size and rebuild speed.
+the container lifecycle, optimizing the build for size and rebuild speed, and
+running the container as an unprivileged user.
 
 The problem containerization solves here is concrete: this app needs Python 3.12
 and seven specific package versions. Without a container, running it on another
@@ -26,7 +27,7 @@ docker-flask-project/
 ├── Dockerfile            # Image build instructions
 ├── .dockerignore         # Excludes files from the build context
 ├── .gitignore
-├── docs/                 # This README
+├── README.md             # This file
 ├── screenshots/          # Evidence of each step
 └── venv/                 # Host virtual environment (not copied into the image)
 ```
@@ -91,15 +92,23 @@ WORKDIR /app
 COPY requirements.txt .
 
 # 4. Install dependencies
+#    Runs as root because writing to system site-packages requires it.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Now copy the rest of the application code
-COPY . .
+# 5. Create an unprivileged user to run the application
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
 
-# 6. Document which port the container listens on
+# 6. Copy the application code, owned by the unprivileged user
+COPY --chown=appuser:appuser . .
+
+# 7. Drop privileges. Everything from here on runs as appuser, including CMD.
+USER appuser
+
+# 8. Document which port the container listens on
 EXPOSE 5000
 
-# 7. The command that runs when the container starts
+# 9. The command that runs when the container starts
 CMD ["python", "app.py"]
 ```
 
@@ -115,13 +124,16 @@ and for the container at runtime. Without it, every `COPY` and the final `CMD`
 would need absolute paths, and the app would land in the filesystem root.
 
 **`COPY requirements.txt .` before `COPY . .`** — this ordering is the single
-most important performance decision in the file, and it is explained in detail
-under [Build optimization](#build-optimization) below.
+most important performance decision in the file, explained under
+[Build optimization](#build-optimization) below.
 
 **`RUN pip install --no-cache-dir -r requirements.txt`** — `--no-cache-dir`
 stops pip from retaining downloaded wheels in `~/.cache/pip`. That cache exists
 to speed up *future* installs on a long-lived machine; inside an image layer it
 is dead weight that is never read again, so it is pure size overhead.
+
+**`RUN useradd ... && chown`, `COPY --chown`, `USER appuser`** — the privilege
+drop, explained in [Running as a non-root user](#running-as-a-non-root-user).
 
 **`EXPOSE 5000`** — documentation, not behaviour. It records which port the
 image expects to serve on, visible via `docker inspect`. It does **not** open or
@@ -132,6 +144,57 @@ publish the port — `-p` at run time does that. An image with `EXPOSE` and no
 The JSON array ("exec form") runs the binary directly rather than wrapping it in
 a shell, which means the process receives signals properly — relevant because
 `docker stop` sends `SIGTERM`, and a shell-wrapped process may not forward it.
+
+## Running as a non-root user
+
+By default, processes inside a container run as `root`. That root is namespaced
+and not equivalent to root on the host, but it is still the wrong default: if the
+application is compromised, root inside the container is a materially better
+position from which to attempt a container escape, write to mounted volumes, or
+install tooling than an unprivileged account would be. Dropping privileges is
+inexpensive defense in depth.
+
+Three ordering details make this work correctly:
+
+**`USER` comes after `pip install`.** Installing into system site-packages
+requires write access to a root-owned directory. Switching users before the
+install makes it fail with a permission error.
+
+**`COPY --chown=appuser:appuser . .`** — without this, copied files are owned by
+root. The application can still *read* them, but any runtime write (a log file, a
+SQLite database, a cache directory) would fail. Setting ownership at copy time is
+cheaper than a separate `chown` layer, which would duplicate every file's storage
+in a new layer.
+
+**`USER` comes before `CMD`.** `USER` applies to every instruction *after* it,
+and determines the identity of the container's main process. Placed after `CMD`
+it would have no effect on the running application at all.
+
+### A constraint worth knowing
+
+Unprivileged users cannot bind to ports below 1024. This app uses port 5000, so
+there is no issue. An app serving on port 80 inside the container would fail to
+start as a non-root user — the usual solutions are to listen on a high port
+internally and map it (`-p 80:8080`), or to grant the
+`CAP_NET_BIND_SERVICE` capability explicitly.
+
+### Verifying it worked
+
+```bash
+docker exec flask-container whoami
+```
+```
+appuser
+```
+
+```bash
+docker exec flask-container id
+```
+```
+uid=1000(appuser) gid=1000(appuser) groups=1000(appuser)
+```
+
+A `uid` of `1000` rather than `0` confirms the process is unprivileged.
 
 ## The .dockerignore
 
@@ -269,7 +332,7 @@ The ordering used here:
 ```dockerfile
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .                               # only this re-runs on a code change
+COPY --chown=appuser:appuser . .       # only this re-runs on a code change
 ```
 Dependencies change rarely; application code changes constantly. Putting the
 rarely-changing step first means the expensive install stays cached.
@@ -330,10 +393,20 @@ like `psycopg2`, `numpy`, or `pandas` later turns a 50 MB saving into a
 significantly worse build. For a project expected to grow, `slim` is the better
 default.
 
-A larger reduction without that tradeoff would come from a **multi-stage build** —
-compiling dependencies in a full image, then copying only the installed packages
-into a slim runtime image — which is unnecessary here because nothing needs
-compiling.
+### Multi-stage builds: considered and rejected
+
+A multi-stage build compiles dependencies in a full image, then copies only the
+installed packages into a slim runtime image, discarding the build toolchain.
+It is the standard answer for compiled languages and for Python projects with
+C extensions.
+
+Here it would save very little. Nothing in this dependency set compiles — Flask
+and its dependencies are pure Python, installed from wheels with no build step —
+so there is no build toolchain to discard. The only recoverable weight would be
+pip itself and its metadata, a few megabytes against a 198 MB image dominated by
+the base layers. The added Dockerfile complexity is not worth that trade for this
+project, though it would be the first thing to revisit if a compiled dependency
+were introduced.
 
 ## Troubleshooting log
 
@@ -353,11 +426,12 @@ docker build -t flask-docker-app .
 docker run -d -p 5000:5000 --name flask-container flask-docker-app
 
 # Inspect
-docker ps                      # running containers
-docker ps -a                   # all containers, including stopped
-docker images flask-docker-app # image size
-docker history flask-docker-app# per-layer size breakdown
-docker logs flask-container    # application output
+docker ps                        # running containers
+docker ps -a                     # all containers, including stopped
+docker images flask-docker-app   # image size
+docker history flask-docker-app  # per-layer size breakdown
+docker logs flask-container      # application output
+docker exec flask-container whoami  # confirm the non-root user
 
 # Lifecycle
 docker stop flask-container
@@ -381,3 +455,5 @@ curl http://localhost:5000
 - [x] **Task 6** — Build optimized: slim base image, dependency-before-code layer
       ordering, `--no-cache-dir`, and `.dockerignore`; 225 MB → 198 MB, with a
       4.2 s cached rebuild verified via `docker history` timestamps
+- [x] **Security** — Container runs as the unprivileged `appuser` (uid 1000)
+      rather than root, verified with `docker exec flask-container whoami`

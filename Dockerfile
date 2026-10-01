@@ -8,13 +8,22 @@ WORKDIR /app
 COPY requirements.txt .
 
 # 4. Install dependencies
+#    Runs as root because writing to system site-packages requires it.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Now copy the rest of the application code
-COPY . .
+# 5. Create an unprivileged user to run the application
+#    --create-home gives the user a valid HOME; some tooling expects one.
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
 
-# 6. Document which port the container listens on
+# 6. Copy the application code, owned by the unprivileged user
+COPY --chown=appuser:appuser . .
+
+# 7. Drop privileges. Everything from here on runs as appuser, including CMD.
+USER appuser
+
+# 8. Document which port the container listens on
 EXPOSE 5000
 
-# 7. The command that runs when the container starts
+# 9. The command that runs when the container starts
 CMD ["python", "app.py"]
