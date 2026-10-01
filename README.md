@@ -5,8 +5,8 @@ This project packages a simple Flask web application into a Docker image so it
 runs identically on any machine with Docker installed, independent of the host's
 Python version, installed packages, or operating system. It covers writing a
 Dockerfile, building an image, running a container with port mapping, managing
-the container lifecycle, optimizing the build for size and rebuild speed, and
-running the container as an unprivileged user.
+the container lifecycle, optimizing the build for size and rebuild speed,
+running the container as an unprivileged user, and health checking.
 
 The problem containerization solves here is concrete: this app needs Python 3.12
 and seven specific package versions. Without a container, running it on another
@@ -108,7 +108,11 @@ USER appuser
 # 8. Document which port the container listens on
 EXPOSE 5000
 
-# 9. The command that runs when the container starts
+# 9. Let Docker verify the app is actually serving, not merely running.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/').read()"
+
+# 10. The command that runs when the container starts
 CMD ["python", "app.py"]
 ```
 
@@ -139,6 +143,9 @@ drop, explained in [Running as a non-root user](#running-as-a-non-root-user).
 image expects to serve on, visible via `docker inspect`. It does **not** open or
 publish the port — `-p` at run time does that. An image with `EXPOSE` and no
 `-p` is unreachable from the host.
+
+**`HEALTHCHECK ...`** — gives Docker a way to tell "serving" from merely
+"running", covered in [Health checking](#health-checking) below.
 
 **`CMD ["python", "app.py"]`** — the default command run when a container starts.
 The JSON array ("exec form") runs the binary directly rather than wrapping it in
@@ -195,6 +202,72 @@ uid=1000(appuser) gid=1000(appuser) groups=1000(appuser)
 ```
 
 A `uid` of `1000` rather than `0` confirms the process is unprivileged.
+
+## Health checking
+
+Without a `HEALTHCHECK`, Docker's only notion of health is "is the main process
+still alive". That is a weak signal: a Flask process can be running while
+deadlocked, stuck on an exhausted connection pool, or returning 500s on every
+request, and `docker ps` would still report `Up` the entire time.
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/').read()"
+```
+
+Docker runs the command inside the container on a schedule and reads its exit
+code: `0` means healthy, `1` means unhealthy. `urllib.request.urlopen` raises on
+a non-2xx response or a connection failure, and an uncaught Python exception
+exits non-zero, so the check needs no explicit error handling.
+
+### Why `python -c` and not `curl`
+
+`curl` is not installed in `python:3.12-slim`. Adding it purely for a health
+check would mean an `apt-get install` layer and a larger image — working directly
+against the optimization work in this project. Python is already present, so
+using it costs nothing.
+
+### The flags
+
+| Flag | Effect |
+|---|---|
+| `--interval=30s` | How often the check runs after the container has started |
+| `--timeout=3s` | A check that takes longer than this counts as a failure |
+| `--start-period=5s` | Grace window at startup; failures here don't count toward `--retries` |
+| `--retries=3` | Consecutive failures before the container is marked `unhealthy` |
+
+`--start-period` matters more than it looks. Without it, a container that takes a
+few seconds to bind its port would be marked unhealthy during normal startup.
+Failures inside the start period are ignored, but a *success* there immediately
+promotes the container to healthy — so a generous start period costs nothing when
+startup is fast.
+
+### Observing it
+
+```bash
+docker ps
+```
+```
+STATUS
+Up 40 seconds (healthy)
+```
+
+The status now carries a health state: `starting` during the start period, then
+`healthy` or `unhealthy`. Full check history, including output from the last few
+runs, is available via:
+
+```bash
+docker inspect --format '{{json .State.Health}}' flask-container
+```
+
+### Why this matters beyond this project
+
+Health status is not just for humans reading `docker ps`. Docker Compose
+(`depends_on` with `condition: service_healthy`) waits on it before starting
+dependent services, and orchestrators use the equivalent concept to decide
+whether to route traffic to an instance or restart it. A container without a
+health check is one an orchestrator cannot reason about — it can only see that a
+process exists.
 
 ## The .dockerignore
 
@@ -432,6 +505,7 @@ docker images flask-docker-app   # image size
 docker history flask-docker-app  # per-layer size breakdown
 docker logs flask-container      # application output
 docker exec flask-container whoami  # confirm the non-root user
+docker inspect --format '{{json .State.Health}}' flask-container  # health history
 
 # Lifecycle
 docker stop flask-container
@@ -457,3 +531,5 @@ curl http://localhost:5000
       4.2 s cached rebuild verified via `docker history` timestamps
 - [x] **Security** — Container runs as the unprivileged `appuser` (uid 1000)
       rather than root, verified with `docker exec flask-container whoami`
+- [x] **Observability** — `HEALTHCHECK` distinguishes a serving app from a
+      merely running process; `docker ps` reports `(healthy)`

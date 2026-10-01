@@ -25,5 +25,10 @@ USER appuser
 # 8. Document which port the container listens on
 EXPOSE 5000
 
-# 9. The command that runs when the container starts
+# 9. Let Docker verify the app is actually serving, not merely running.
+#    Uses python rather than curl, which is not installed in the slim image.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/').read()"
+
+# 10. The command that runs when the container starts
 CMD ["python", "app.py"]
